@@ -1,57 +1,98 @@
-﻿using System.Threading.Tasks;
-using System;
-using X11;
-using System.Drawing;
-using System.Runtime.InteropServices;
+using System.Globalization;
 
-namespace test
+namespace X11PointerDemo;
+
+internal static class Program
 {
-    using static X11.Xlib;
-    class Program
+    private const string Usage =
+        "Usage: dotnet run -- [--once] [--center]\n" +
+        "Observe the X11 pointer at 10 Hz; press Ctrl+C to stop.\n" +
+        "--once    Print one position and exit.\n" +
+        "--center  Move to the default X screen's center before observing.";
+
+    private static int Main(string[] args)
     {
-
-        [DllImport("libX11.so.6")]
-        static extern void XWarpPointer(IntPtr display,
-            Window src_w,
-            Window dest_w,
-            int src_x, int src_y,
-            int src_width, int src_height,
-            int dest_x, int dest_y);
-        static async Task Main(string[] args)
+        if (args.Length == 1 && args[0] is "--help" or "-h")
         {
-            var hDisplay = XOpenDisplay(null);
-            int screen = XDefaultScreen(hDisplay);
-            Window root_window = XRootWindow(hDisplay, screen);
+            Console.WriteLine(Usage);
+            return 0;
+        }
 
-            XWarpPointer(hDisplay, Window.None, root_window, 0, 0, 0, 0, 1920 / 2, 1080 / 2);
-            XFlush(hDisplay);
-
-            while (true)
+        bool once = false;
+        bool center = false;
+        foreach (string argument in args)
+        {
+            switch (argument)
             {
-                Console.SetCursorPosition(0, Console.GetCursorPosition().Top);
-                Point p = await GetMousePosAsync(hDisplay, root_window);
-                Console.Write($"{{X:{p.X:0000},Y:{p.Y:0000}}}");
+                case "--once" when !once: once = true; break;
+                case "--center" when !center: center = true; break;
+                default:
+                    Console.Error.WriteLine(Usage);
+                    return 2;
             }
         }
 
-        private static async Task<Point> GetMousePosAsync(IntPtr hDisplay, Window root_window)
+        if (!OperatingSystem.IsLinux())
         {
-            return await Task.Run(() =>
-            {
-                Window window_returned = default;
-                int rootX, rootY, winX, winY;
-                rootX = rootY = winX = winY = 0;
-                uint maskReturn = 0;
+            Console.Error.WriteLine("This example requires Linux and an accessible X11 display.");
+            return 1;
+        }
 
-                var result = XQueryPointer(hDisplay,
-                                            root_window,
-                                            ref window_returned, ref window_returned,
-                                            ref rootX, ref rootY,
-                                            ref winX, ref winY,
-                                            ref maskReturn
-                                            );
-                return new Point(rootX, rootY);
-            });
+        try
+        {
+            using var display = Xlib.OpenDisplay();
+            if (display.IsInvalid)
+                throw new InvalidOperationException(
+                    "Cannot open the X display. Check DISPLAY and your session's X11 access.");
+
+            int screen = Xlib.XDefaultScreen(display);
+            nuint root = Xlib.XRootWindow(display, screen);
+            if (center)
+            {
+                int x = Xlib.XDisplayWidth(display, screen) / 2;
+                int y = Xlib.XDisplayHeight(display, screen) / 2;
+                _ = Xlib.XWarpPointer(display, 0, root, 0, 0, 0, 0, x, y);
+                _ = Xlib.XFlush(display);
+            }
+
+            using var stopped = new ManualResetEventSlim();
+            ConsoleCancelEventHandler cancel = (_, eventArgs) =>
+            {
+                eventArgs.Cancel = true;
+                stopped.Set();
+            };
+            Console.CancelKeyPress += cancel;
+            try
+            {
+                do
+                {
+                    // All Xlib calls stay on this thread; no XInitThreads is needed.
+                    int sameScreen = Xlib.XQueryPointer(display, root, out _, out _,
+                        out int rootX, out int rootY, out _, out _, out _);
+                    if (sameScreen == 0)
+                    {
+                        Console.Error.WriteLine("The pointer is on another X screen.");
+                        if (once) return 1;
+                    }
+                    else
+                    {
+                        Console.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                            $"X: {rootX}, Y: {rootY}"));
+                    }
+                } while (!once && !stopped.Wait(100));
+            }
+            finally
+            {
+                Console.CancelKeyPress -= cancel;
+            }
+            return 0;
+        }
+        catch (Exception error) when (error is DllNotFoundException
+                                      or EntryPointNotFoundException
+                                      or InvalidOperationException)
+        {
+            Console.Error.WriteLine(error.Message);
+            return 1;
         }
     }
 }
